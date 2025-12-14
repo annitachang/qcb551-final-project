@@ -1,0 +1,200 @@
+---
+title: "QCB551_FP"
+author: "Hiba Dardari"
+date: "2025-11-13"
+output: pdf_document
+---
+
+```{r}
+library(Seurat)
+library(Matrix)
+library(data.table)
+```
+
+
+```{r}
+base <- "." 
+mtx_file     <- file.path(base, "GSE211644_fresh_matrix.mtx.gz")
+genes_file   <- file.path(base, "GSE211644_fresh_genes.tsv.gz")
+barcodes_file<- file.path(base, "GSE211644_fresh_barcodes.tsv.gz")
+meta_file    <- file.path(base, "GSE211644_fresh_metadata.csv.gz")
+
+# Print what we will read (useful log)
+cat("Files:\n", mtx_file, "\n", genes_file, "\n", barcodes_file, "\n", meta_file, "\n\n")
+
+```
+
+
+```{r}
+cat("Reading matrix (this might take a few seconds)...\n")
+counts <- readMM(gzfile(mtx_file))
+# Rows are genes (33538), columns are cells (22164)
+
+```
+
+```{r}
+cat("Reading genes and barcodes lists...\n")
+genes_dt   <- read.table(genes_file, header=FALSE)
+barcodes_dt<- read.table(barcodes_file, header=FALSE)
+head(genes_dt)
+head(barcodes_dt)
+
+```
+```{r}
+# rownames = gene names; colnames = cell barcodes
+rownames(counts) <- as.character(genes_dt[[1]])
+colnames(counts)  <- as.character(barcodes_dt[[1]])
+cat("Assigned row (genes) and column (barcodes) names to the matrix.\n")
+
+```
+```{r}
+# Reading metadata: assigns each cell (22164) to a cluster. There are 13 clusters.
+
+cat("Reading metadata CSV...\n")
+meta <- read.csv(meta_file, header=TRUE)
+head(meta)
+dim(meta)
+# Clusters:
+# unique(meta[,2])
+```
+
+
+```{r}
+# Set metadata rownames to barcode so we can align rows easily to colnames(counts)
+rownames(meta) <- meta$barcode
+
+# Quick check: how many metadata entries match matrix barcodes?
+matched <- sum(colnames(counts) %in% rownames(meta))
+cat("Metadata entries matching matrix barcodes:", matched, "out of", ncol(counts), "cells.\n")
+if (matched != ncol(counts)) cat("Warning: some barcodes in the matrix are missing metadata (or vice versa). Check alignment.\n")
+
+```
+
+```{r}
+# CreateSeuratObject takes a counts matrix (genes x cells) and optional metadata (data.frame).
+cat("Creating Seurat object...\n")
+seu <- CreateSeuratObject(counts = counts, meta.data = meta, min.cells = 0, min.features = 200)
+# min.cells/min.features are filters: remove genes expressed in <3 cells and cells with <200 detected features. Nothing was filtered out here. Same dims as start
+cat("Seurat object created: cells =", ncol(seu), "genes =", nrow(seu), "\n")
+
+
+```
+```{r}
+cat("No 'sample' column in metadata. Creating 'sample' from barcode by splitting at '_' (if applicable)...\n")
+seu$sample <- sapply(strsplit(rownames(seu@meta.data), "_"), `[`, 1)
+cat("Created 'sample' column from barcodes.\n")
+```
+```{r}
+# Split object by sample (so we can run Normalize/FindVariable on each batch separately)
+# SplitObject returns a list of Seurat objects, one per unique value in seu$sample
+cat("Splitting Seurat object by 'sample' into a list of Seurat objects...\n")
+seu_list <- SplitObject(seu, split.by = "sample")
+cat("Number of split objects (samples):", length(seu_list), "\n")
+```
+```{r}
+# For each sample: NormalizeData (log-normalize), then FindVariableFeatures (VST, top 5000)
+cat("Normalizing and finding variable features per sample (nfeatures = 5000)...\n")
+for (i in seq_along(seu_list)) {
+  obj <- seu_list[[i]]
+  obj <- NormalizeData(obj, verbose = FALSE)             # scale counts per cell and log-transform
+  obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 5000, verbose = FALSE)
+  seu_list[[i]] <- obj  # put back into list
+  cat("  processed sample:", names(seu_list)[i], "  variable features:", length(VariableFeatures(obj)), "\n")
+}
+```
+```{r}
+cat("Selecting top 5000 features for integration...\n")
+features <- SelectIntegrationFeatures(object.list = seu_list, nfeatures = 5120)
+cat("Selected", length(features), "integration features.\n")
+```
+```{r}
+# The pattern ^TR[ABGD][VDJ] matches gene symbols like TRAV, TRBV, TRGD, TRDV, etc.
+# We remove those genes from the integration feature set so TCR genes do not drive batch correction.
+cat("Removing TCR variable genes matching regex '^TR[ABGD][VDJ]' from integration features...\n")
+tcr_pattern <- "^TR[ABGD][VDJ]"      # regex provided in your instructions
+tcr_genes <- grep(tcr_pattern, features, value = TRUE)
+cat("Found", length(tcr_genes), "TCR-like genes in the feature list (they will be excluded).\n")
+
+anchor_features <- setdiff(features, tcr_genes)
+cat("Anchor features after excluding TCR genes:", length(anchor_features), "\n")
+
+```
+
+```{r}
+# Optional scaling: Revisit
+
+#cat("Scaling anchor features for each split object (this centers and scales expression per gene)...\n")
+#for (i in seq_along(seu_list)) {
+#  seu_list[[i]] <- ScaleData(seu_list[[i]], features = anchor_features, verbose = FALSE)
+#  cat("  scaled:", names(seu_list)[i], "\n")
+#}
+```
+
+```{r}
+# FindIntegrationAnchors finds pairs of cells across datasets that are mutual nearest neighbors in PCA space.
+# We set dims = 1:30 (use first 30 PCs) and k.anchor = 20 as you requested.
+cat("Finding integration anchors using dims=1:30 and k.anchor=20...\n")
+anchors <- FindIntegrationAnchors(object.list = seu_list,
+                                  anchor.features = anchor_features,
+                                  dims = 1:30,
+                                  k.anchor = 20,
+                                  verbose = TRUE)
+cat("Anchors found. Proceeding to IntegrateData...\n")
+```
+
+```{r}
+# IntegrateData uses the anchors to compute a corrected, integrated expression matrix ("integrated" assay).
+seu_integrated <- IntegrateData(anchorset = anchors, dims = 1:30)
+cat("Integration finished. The integrated data are stored in the 'integrated' assay.\n")
+
+```
+
+
+```{r}
+# Set the default assay to "integrated" so subsequent commands operate on the corrected data.
+DefaultAssay(seu_integrated) <- "integrated"
+
+# Scale the integrated data (mean=0, sd=1 per gene) before PCA.
+seu_integrated <- ScaleData(seu_integrated, verbose = FALSE)
+cat("Scaled integrated data.\n")
+
+# Run PCA and retain 30 PCs as requested.
+seu_integrated <- RunPCA(seu_integrated, npcs = 30, verbose = FALSE)
+cat("Computed PCA (30 PCs).\n")
+
+# Compute a neighborhood graph based on the first 30 PCs (used for UMAP and clustering).
+seu_integrated <- FindNeighbors(seu_integrated, dims = 1:30)
+cat("Computed neighbor graph (using PCs 1:30).\n")
+
+# Run UMAP using PCs 1:30 to create a 2D embedding.
+seu_integrated <- RunUMAP(seu_integrated, dims = 1:30)
+cat("Computed UMAP embedding.\n")
+
+# (Optional) Run clustering so you can color UMAP by clusters (resolution controls granularity)
+seu_integrated <- FindClusters(seu_integrated, resolution = 0.5)
+cat("Performed clustering (resolution = 0.5).\n")
+```
+
+```{r}
+# Two quick plots: colored by sample (to check mixing) and by clusters.
+cat("Plotting UMAP colored by sample and clusters. Close plot windows to continue.\n")
+DimPlot(seu_integrated, group.by = "sample", reduction = "umap") + ggtitle("Integrated UMAP: colored by sample")
+DimPlot(seu_integrated, label = TRUE) + ggtitle("Integrated UMAP: clusters")
+
+```
+```{r}
+library(ggplot2)
+DimPlot(
+  seu_integrated,
+  reduction = "umap",
+  group.by = "cluster",
+  label = TRUE,     # write cluster labels on UMAP
+  repel = TRUE      # prevent overlapping labels
+) + ggtitle("UMAP Colored by Metadata Cluster")
+```
+
+
+
+
+
+
